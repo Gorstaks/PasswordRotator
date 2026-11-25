@@ -1,22 +1,64 @@
-name: Release
+name: Build & Release
+# Builds on every push and pull request. On the default branch, publishes a GitHub
+# release (tag v<version>) when none exists yet for the version read from the source.
+# Existing releases are never overwritten: bump the version to publish a new one.
 on:
   push:
-    tags: ['v*']
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch: {}
 permissions:
   contents: write
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  release:
+  build:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Build
+      - name: Read version
+        id: ver
         shell: pwsh
+        run: |
+          $text = Get-Content -LiteralPath 'build.ps1' -Raw
+          if ($text -notmatch 'releases/(\d+\.\d+\.\d+)') { throw 'Version not found in build.ps1' }
+          $v = ([regex]::Match($Matches[1], '^\d+\.\d+\.\d+')).Value
+          if (-not $v) { throw "Not MAJOR.MINOR.PATCH: $($Matches[1])" }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Version: $v"
+      - name: Check whether release exists
+        id: exists
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $publish = 'false'
+          if ('${{ github.event_name }}' -ne 'pull_request' -and '${{ github.ref_name }}' -in 'main','master') {
+            $tag = "v${{ steps.ver.outputs.version }}"
+            $out = & gh release view $tag --json tagName 2>&1 | Out-String
+            if ($LASTEXITCODE -eq 0) { Write-Host "Release $tag already exists." }
+            elseif ($out -match 'release not found|HTTP 404|Not Found') { $publish = 'true'; Write-Host "Release $tag will be published." }
+            else { throw "Release lookup failed: $out" }
+            $global:LASTEXITCODE = 0
+          }
+          "publish=$publish" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build
+        shell: powershell
         run: ./build.ps1
       - name: Publish release
+        if: steps.exists.outputs.publish == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $files = @(Get-ChildItem releases\*\PasswordRotator.exe -File | ForEach-Object FullName)
           if ($files.Count -eq 0) { throw 'No release files produced' }
-          gh release create $env:GITHUB_REF_NAME @files --title $env:GITHUB_REF_NAME --generate-notes
+          gh release create "v${{ steps.ver.outputs.version }}" @files `
+            --title "PasswordRotator ${{ steps.ver.outputs.version }}" `
+            --target ${{ github.sha }} `
+            --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
